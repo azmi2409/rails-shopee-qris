@@ -33,6 +33,7 @@ module Rails
 
         def request_otp(phone_number = Rails::Shopee::Qris.configuration.phone_number, password: nil, channel: nil, device_report: Rails::Shopee::Qris.configuration.device_report)
           phone_info = parse_id_mobile(phone_number)
+          raise Error, "Supply a captured Shopee device report to request an OTP" unless device_report.is_a?(String) && !device_report.strip.empty?
           phone = phone_info[:e164]
           @cookies.clear
 
@@ -339,14 +340,10 @@ module Rails
             "Origin" => ACCOUNT_BASE_URL,
             "Referer" => "#{ACCOUNT_BASE_URL}/"
           )
-          if device_report.to_s.strip.empty?
-            headers["Content-Type"] = "application/json"
-            body = "{}"
-          else
-            headers["Content-Type"] = "text/plain;charset=UTF-8"
-            headers["szdet"] = (Time.now.to_f * 1000).to_i.to_s
-            body = device_report.to_s
-          end
+          headers["Content-Type"] = "text/plain;charset=UTF-8"
+          headers["szdet"] = (Time.now.to_f * 1000).to_i.to_s
+          body = device_report
+
           resp = send_request(:post, DEVICE_FINGERPRINT_REPORT_URL, headers: headers, body: body)
           parsed = parse_json(resp)
           risk_token = parsed[:data].is_a?(Hash) ? parsed[:data][:riskToken] : nil
