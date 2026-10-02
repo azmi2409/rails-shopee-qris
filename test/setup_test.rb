@@ -329,7 +329,7 @@ class SetupTest < Minitest::Test
     assert_raises(Rails::Shopee::Qris::Error) { auth.complete_login(verification_fixture.merge(version: 2)) }
     assert_raises(Rails::Shopee::Qris::Error) { auth.refresh_session({ version: 2 }) }
     assert_raises(Rails::Shopee::Qris::Error) { auth.complete_login(verification_fixture.merge(toc_nonce: "")) }
-    assert_raises(Rails::Shopee::Qris::Error) { auth.request_otp("081234567890", device_report: "") }
+    assert_raises(Rails::Shopee::Qris::Error) { auth.request_otp("12345") }
     assert_empty auth.requests
   end
 
