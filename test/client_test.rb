@@ -356,6 +356,39 @@ class ClientTest < Minitest::Test
     end
   end
 
+  def test_manual_token_session_surfaces_rejection_instead_of_fake_refresh_error
+    client = payment_client([{ code: 200020, msg: "NotAuthorized" }])
+    client.instance_variable_set(:@token, "B:stale")
+    client.instance_variable_set(:@store_id, "123")
+
+    error = assert_raises(Rails::Shopee::Qris::Error) { client.list_stores }
+
+    assert_includes error.message, "rejected the merchant token"
+    assert_equal "200020", error.code.to_s
+    refute_includes error.message, "cannot be refreshed"
+  end
+
+  def test_expiring_session_without_renewal_credentials_does_not_block_feed
+    client = payment_client([{ code: 0, data: { list: [], next_position: "" } }])
+    client.instance_variable_set(:@token, "B:manual")
+    client.instance_variable_set(:@store_id, "123")
+    client.instance_variable_set(:@expires_at, Time.now)
+
+    assert_equal [], client.transactions_between(start_time: 1000, end_time: 2000)
+  end
+  def test_accepts_outer_jwt_and_extracts_inner_token
+    header = Base64.urlsafe_encode64({ alg: "RS256" }.to_json, padding: false)
+    payload = Base64.urlsafe_encode64({ userid: "998877", token: "B:extracted_inner", exp: 1877328931 }.to_json, padding: false)
+    jwt = "#{header}.#{payload}.signature"
+
+    client = Rails::Shopee::Qris::Client.new(token: jwt)
+
+    assert_equal "B:extracted_inner", client.token
+    assert_equal "998877", client.merchant_id
+    assert_equal Time.at(1877328931), client.expires_at
+  end
+
+
   private
 
   def payment_client(responses)

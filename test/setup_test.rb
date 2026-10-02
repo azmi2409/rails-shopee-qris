@@ -88,6 +88,120 @@ class SetupTest < Minitest::Test
     refute_nil challenge[:cookies]
   end
 
+  def test_request_otp_continues_when_account_has_no_password
+    setup_class = Class.new(Rails::Shopee::Qris::Setup) do
+      attr_reader :sent_calls
+
+      def initialize(...)
+        @sent_calls = []
+        super(...)
+      end
+
+      private
+
+      def execute_request(req, uri)
+        @sent_calls << { method: req.method, url: uri.to_s, body: req.body }
+        case uri.path
+        when "/v2/shpsec/web/report"
+          fake_response(200, { code: 0, data: { riskToken: "risk" } }.to_json)
+        when "/api/v4/account/business/check_account_exist_by_password"
+          fake_response(200, { error: 10002 }.to_json)
+        when "/api/v4/account/business/authenticate_toc_by_password"
+          fake_response(200, { error: 10002, data: {} }.to_json)
+        when "/api/v4/account/business/get_otp_settings"
+          fake_response(200, { error: 0, data: { available_channel_list: [1, 2], default_channel: 1 } }.to_json)
+        when "/api/v4/account/business/send_otp"
+          fake_response(200, { error: 0, data: { available_channel_list: [1, 2], seed: "seed_abc" } }.to_json)
+        else
+          fake_response(200, { error: 0, data: {} }.to_json)
+        end
+      end
+
+      def fake_response(code, body, headers = {})
+        res = Net::HTTPResponse::CODE_TO_OBJ[code.to_s].new("1.1", code.to_s, "OK")
+        headers.each { |k, v| Array(v).each { |val| res.add_field(k, val) } }
+        res.instance_variable_set(:@read, true)
+        res.body = body
+        res
+      end
+    end
+
+    challenge = setup_class.new.request_otp("081234567890", device_report: "captured-report")
+
+    assert_equal false, challenge[:has_password]
+    assert_equal 1, challenge[:channel]
+    assert_equal [1, 2], challenge[:available_channels]
+  end
+
+  def test_request_otp_rejects_unavailable_channel
+    setup_class = Class.new(Rails::Shopee::Qris::Setup) do
+      private
+
+      def execute_request(_req, uri)
+        case uri.path
+        when "/v2/shpsec/web/report"
+          fake_response(200, { code: 0, data: { riskToken: "risk" } }.to_json)
+        when "/api/v4/account/business/authenticate_toc_by_password"
+          fake_response(200, { error: 10002, data: {} }.to_json)
+        when "/api/v4/account/business/get_otp_settings"
+          fake_response(200, { error: 0, data: { available_channel_list: [1, 2], default_channel: 1 } }.to_json)
+        else
+          fake_response(200, { error: 0, data: {} }.to_json)
+        end
+      end
+
+      def fake_response(code, body, headers = {})
+        res = Net::HTTPResponse::CODE_TO_OBJ[code.to_s].new("1.1", code.to_s, "OK")
+        headers.each { |k, v| Array(v).each { |val| res.add_field(k, val) } }
+        res.instance_variable_set(:@read, true)
+        res.body = body
+        res
+      end
+    end
+
+    error = assert_raises(Rails::Shopee::Qris::Error) do
+      setup_class.new.request_otp("081234567890", device_report: "captured-report", channel: 3)
+    end
+
+    assert_includes error.message, "channel 3 is unavailable"
+    assert_includes error.message, "SMS"
+  end
+
+  def test_verify_otp_maps_wrong_code_to_actionable_message
+    setup_class = Class.new(Rails::Shopee::Qris::Setup) do
+      private
+
+      def execute_request(_req, uri)
+        case uri.path
+        when "/api/v4/account/business/verify_otp"
+          fake_response(200, { error: 48401003 }.to_json)
+        else
+          fake_response(200, { error: 0, data: {} }.to_json)
+        end
+      end
+
+      def fake_response(code, body, headers = {})
+        res = Net::HTTPResponse::CODE_TO_OBJ[code.to_s].new("1.1", code.to_s, "OK")
+        headers.each { |k, v| Array(v).each { |val| res.add_field(k, val) } }
+        res.instance_variable_set(:@read, true)
+        res.body = body
+        res
+      end
+    end
+
+    challenge = {
+      version: 1,
+      phone_number: "628999999999",
+      device_fingerprint: "risk",
+      cookies: []
+    }
+
+    error = assert_raises(Rails::Shopee::Qris::Error) { setup_class.new.verify_otp(challenge, "000000") }
+
+    assert_includes error.message, "wrong or expired"
+    assert_equal 48_401_003, error.code
+  end
+
   def test_verify_otp_authenticates_and_detects_merchants
     setup_class = Class.new(Rails::Shopee::Qris::Setup) do
       private

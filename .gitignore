@@ -20,3 +20,6 @@
 *.key
 *.pem
 .DS_Store
+
+# Local merchant QRIS payload (never commit)
+qr.txt

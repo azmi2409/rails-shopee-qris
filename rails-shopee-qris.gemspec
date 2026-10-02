@@ -2,7 +2,7 @@
 
 Gem::Specification.new do |spec|
   spec.name = "rails-shopee-qris"
-  spec.version = "0.1.0"
+  spec.version = "0.2.0"
   spec.authors = ["Azmi"]
   spec.summary = "Unofficial ShopeePay QRIS client"
   spec.description = "Generate dynamic QRIS codes and access ShopeePay merchant transactions."
@@ -13,6 +13,6 @@ Gem::Specification.new do |spec|
   }
   spec.license = "MIT"
   spec.required_ruby_version = ">= 3.1"
-  spec.files = Dir["lib/**/*.rb", "README.md", "LICENSE.txt"]
+  spec.files = Dir["lib/**/*.rb", "README.md", "CHANGELOG.md", "LICENSE.txt"]
   spec.require_paths = ["lib"]
 end

@@ -25,16 +25,22 @@ module Rails
         )
           config = Rails::Shopee::Qris.configuration
           raise Error, "Shopee session must be an object" if session && !session.is_a?(Hash)
-          @session = session && JSON.parse(JSON.generate(session), symbolize_names: true)
-          @token = token || @session&.dig(:token) || config.token
+          @session = session && deep_symbolize(session)
+          raw_token = token || @session&.dig(:token) || config.token
+          parsed_token, token_meta = parse_token_input(raw_token)
+          @token = parsed_token
           @store_id = (store_id || @session&.dig(:store_id) || config.store_id)&.to_s
-          @merchant_id = (merchant_id || @session&.dig(:merchant, :id) || @session&.dig(:merchant_id) || config.merchant_id)&.to_s
+          @merchant_id = (merchant_id || @session&.dig(:merchant, :id) || @session&.dig(:merchant_id) || token_meta[:account_id] || config.merchant_id)&.to_s
           @phone_number = phone_number || @session&.dig(:phone_number) || config.phone_number
           @device_id = device_id || @session&.dig(:switch_credential, :spc_clientid)
-          expiry = expires_at || @session&.dig(:expires_at)
+          expiry = expires_at || @session&.dig(:expires_at) || token_meta[:expires_at]
           @expires_at = extract_time(expiry)
           raise Error, "Invalid Shopee session expiry" if expiry && !@expires_at
-          @session[:expires_at] = @expires_at if @session && expiry
+          if @session
+            @session[:token] = @token if @token
+            @session[:merchant_id] ||= @merchant_id if @merchant_id
+            @session[:expires_at] = @expires_at if expiry
+          end
         end
 
         attr_reader :token, :store_id, :merchant_id, :session, :phone_number, :device_id, :expires_at
@@ -53,9 +59,14 @@ module Rails
           raise Error, "Invalid payment amount"
         end
 
+        def refreshable?
+          session.is_a?(Hash) && session[:switch_credential].is_a?(Hash)
+        end
+
         def refresh!
-          unless session.is_a?(Hash) && session[:switch_credential].is_a?(Hash)
-            raise Error, "Shopee session cannot be refreshed without full session credentials; reconnect with OTP"
+          unless refreshable?
+            raise Error, "Shopee merchant token is invalid or expired and this session has no renewal " \
+                         "credentials; log in again with OTP or paste a fresh B:... token"
           end
 
           updated = Setup.new.refresh_session(session)
@@ -66,7 +77,7 @@ module Rails
         end
 
         def transactions_between(start_time:, end_time:, store_id: @store_id, page_size: 10, max_pages: 20)
-          refresh! if expires_at && expires_at <= Time.now + 900 && session
+          refresh! if refreshable? && expires_at && expires_at <= Time.now + 900
 
           start_ts = start_time.respond_to?(:to_i) ? start_time.to_i : Integer(start_time)
           end_ts = end_time.respond_to?(:to_i) ? end_time.to_i : Integer(end_time)
@@ -307,6 +318,43 @@ module Rails
         rescue ArgumentError, TypeError, RangeError
           nil
         end
+        def deep_symbolize(obj)
+          case obj
+          when Hash
+            obj.each_with_object({}) do |(k, v), acc|
+              acc[k.to_sym] = deep_symbolize(v)
+            end
+          when Array
+            obj.map { |item| deep_symbolize(item) }
+          else
+            obj
+          end
+        end
+
+        def parse_token_input(val)
+          return [nil, {}] if val.nil?
+
+          str = val.to_s.strip.gsub(/[\r\n\t ]/, "")
+          return [str, {}] if str.start_with?("B:")
+
+          if str.count(".") == 2
+            segments = str.split(".")
+            padded = segments[1] + ("=" * (-segments[1].bytesize % 4))
+            payload = JSON.parse(Base64.urlsafe_decode64(padded), symbolize_names: true)
+            if payload.is_a?(Hash) && payload[:token].to_s.start_with?("B:")
+              meta = {
+                account_id: payload[:userid]&.to_s,
+                expires_at: payload[:exp] ? Time.at(payload[:exp]) : nil
+              }
+              return [payload[:token].to_s, meta]
+            end
+          end
+
+          [str, {}]
+        rescue StandardError
+          [str, {}]
+        end
+
 
         def request_payment(url, inner_data, retried: false)
           raise Error, "Shopee merchant token is missing; configure token or login with OTP" if token.to_s.empty?
@@ -326,14 +374,21 @@ module Rails
           raise Error, "Shopee returned a non-object response" unless resp.is_a?(Hash)
           code = resp[:code].to_s
 
-          if (code != "0" && INVALID_TOKEN_CODES.include?(code)) && session && !retried
-            refresh!
-            return request_payment(url, inner_data, retried: true)
+          if code != "0" && INVALID_TOKEN_CODES.include?(code) && !retried
+            if refreshable?
+              refresh!
+              return request_payment(url, inner_data, retried: true)
+            end
+
+            raise Error.new(
+              "Shopee rejected the merchant token (code #{code}); it is invalid or expired. " \
+              "Log in again with OTP or paste a fresh B:... token.",
+              nil, resp[:code], resp
+            )
           end
 
           err = Response.error(resp)
           raise Error.new(err || "ShopeePay request failed", nil, resp[:code], resp) if err
-          Response.data(resp)
 
           resp
         end

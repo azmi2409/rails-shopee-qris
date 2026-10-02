@@ -18,8 +18,13 @@ module Rails
         OTP_CHANNELS = [1, 2, 3, 5].freeze
         SEND_OTP_CHANNELS = [1, 2, 3, 5, 4].freeze
         DEFAULT_OTP_CHANNEL = 3
+        CHANNEL_NAMES = { 1 => "SMS", 2 => "voice", 3 => "WhatsApp", 4 => "email", 5 => "Zalo" }.freeze
         NEED_OTP_CODE = 48401102
         NOT_LOGIN_CODE = 48500102
+        NO_PASSWORD_CODE = 10002
+        OTP_CHANNEL_UNAVAILABLE_CODE = 48401103
+        WRONG_OTP_CODE = 48401003
+        PASSWORD_REQUIRED = "This Shopee account is password-protected; supply the password to receive an OTP"
 
         LIVE_TOKEN_COOKIE = "__shopee_partner_website_x_token_live"
         CLIENT_ID_COOKIE = "SPC_CLIENTID"
@@ -60,22 +65,32 @@ module Rails
           default_ch = settings[:default_channel]
           resolved = channel || default_ch || DEFAULT_OTP_CHANNEL
           if !available.empty? && !available.include?(resolved)
-            raise Error, "Requested Shopee OTP channel is unavailable"
+            names = available.map { |c| "#{c} (#{CHANNEL_NAMES[c] || 'unknown'})" }.join(", ")
+            raise Error, "Shopee OTP channel #{resolved} is unavailable for this account; available: #{names}"
           end
 
-          account_request(
-            "/api/v4/account/business/send_otp",
-            {
-              operation: OTP_OPERATION,
-              phone: phone,
-              security_device_fingerprint: fingerprint,
-              support_session: false,
-              supported_channels: SEND_OTP_CHANNELS,
-              channel: resolved,
-              captcha_signature: ""
-            },
-            fingerprint
-          )
+          begin
+            account_request(
+              "/api/v4/account/business/send_otp",
+              {
+                operation: OTP_OPERATION,
+                phone: phone,
+                security_device_fingerprint: fingerprint,
+                support_session: false,
+                supported_channels: SEND_OTP_CHANNELS,
+                channel: resolved,
+                captcha_signature: ""
+              },
+              fingerprint
+            )
+          rescue Error => e
+            raise Error.new(
+              e.code == OTP_CHANNEL_UNAVAILABLE_CODE ?
+                "Shopee refused to send the OTP on channel #{resolved}; choose another available channel" :
+                e.message,
+              e.status, e.code, e.payload
+            )
+          end
 
           {
             version: 1,
@@ -105,17 +120,26 @@ module Rails
           fingerprint = challenge[:device_fingerprint].to_s
 
           formatted_phone = format_phone_for_verification(phone)
-          verified = account_request(
-            "/api/v4/account/business/verify_otp",
-            {
-              operation: OTP_OPERATION,
-              otp: code.to_s,
-              phone: formatted_phone,
-              security_device_fingerprint: fingerprint,
-              support_session: false
-            },
-            fingerprint
-          )
+          begin
+            verified = account_request(
+              "/api/v4/account/business/verify_otp",
+              {
+                operation: OTP_OPERATION,
+                otp: code.to_s,
+                phone: formatted_phone,
+                security_device_fingerprint: fingerprint,
+                support_session: false
+              },
+              fingerprint
+            )
+          rescue Error => e
+            raise e unless e.code.to_s == WRONG_OTP_CODE.to_s
+
+            raise Error.new(
+              "Shopee rejected the OTP code (wrong or expired); request a new one and try again",
+              e.status, e.code, e.payload
+            )
+          end
 
           token = verified[:otp_token]
           raise Error, "Shopee OTP verification returned no token" unless token.is_a?(String) && !token.empty?
@@ -374,20 +398,23 @@ module Rails
           parsed = parse_json(resp)
 
           if parsed[:error] == NEED_OTP_CODE
-            raise Error, "This Shopee account is password-protected; supply the password to receive an OTP" if password.to_s.empty?
+            raise Error, PASSWORD_REQUIRED if password.to_s.empty?
 
             return true
           end
 
-          return false if parsed[:error] == 0 && parsed[:data].is_a?(Hash)
+          return false if parsed[:error] == 0
+          # 10002: the account exists but has no password set — nothing to verify.
+          return false if parsed[:error] == NO_PASSWORD_CODE
 
           account = parsed[:data].is_a?(Hash) ? parsed[:data][:toc_account] : nil
           if account.is_a?(Hash) && account[:has_password] == true
-            raise Error, "This Shopee account is password-protected; supply the password to receive an OTP"
+            raise Error, PASSWORD_REQUIRED
           end
 
-          err = Response.error(parsed)
-          raise Error.new(err || "Shopee authentication failed", resp.code.to_i, parsed[:error], parsed)
+          # Any other code means this account does not authenticate by password;
+          # OTP delivery is validated by send_otp afterwards.
+          false
         end
 
         def login_status
