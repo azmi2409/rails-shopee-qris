@@ -20,6 +20,15 @@ class QrisTest < Minitest::Test
     assert_equal Rails::Shopee::Qris::Qris.crc16(result[0...-4]), result[-4, 4]
   end
 
+  def test_leading_zero_amount_remains_decimal_in_code_and_public_result
+    result = Rails::Shopee::Qris::Client.new.create_qris(amount: "010")
+    assert_equal 10, result[:amount]
+    assert_equal "10", Rails::Shopee::Qris::Qris.parse(result[:qris_code]).assoc("54").last
+    result = Rails::Shopee::Qris::Client.new.create_qris(amount: "08")
+    assert_equal 8, result[:amount]
+    assert_equal "8", Rails::Shopee::Qris::Qris.parse(result[:qris_code]).assoc("54").last
+  end
+
   def test_rejects_invalid_checksum
     assert_raises(Rails::Shopee::Qris::Error) do
       Rails::Shopee::Qris::Qris.generate(@template.sub(/.\z/, "0"), 75_000)

@@ -376,6 +376,14 @@ class ClientTest < Minitest::Test
 
     assert_equal [], client.transactions_between(start_time: 1000, end_time: 2000)
   end
+
+  def test_manual_refresh_refusal_leaves_credential_usable
+    client = payment_client([{ code: 0, data: { list: [], next_position: "" } }])
+    original_token = client.token
+    assert_raises(Rails::Shopee::Qris::Error) { client.refresh! }
+    assert_equal original_token, client.token
+    assert_equal [], client.transactions_between(start_time: 1000, end_time: 2000)
+  end
   def test_accepts_outer_jwt_and_extracts_inner_token
     header = Base64.urlsafe_encode64({ alg: "RS256" }.to_json, padding: false)
     payload = Base64.urlsafe_encode64({ userid: "998877", token: "B:extracted_inner", exp: 1877328931 }.to_json, padding: false)
@@ -384,8 +392,68 @@ class ClientTest < Minitest::Test
     client = Rails::Shopee::Qris::Client.new(token: jwt)
 
     assert_equal "B:extracted_inner", client.token
-    assert_equal "998877", client.merchant_id
+    assert_equal "67890", client.merchant_id
     assert_equal Time.at(1877328931), client.expires_at
+  end
+
+  def test_jwt_staff_account_does_not_add_merchant_scope
+    Rails::Shopee::Qris.configuration.merchant_id = nil
+    payload = Base64.urlsafe_encode64({ userid: "staff-id", token: "B:inner" }.to_json, padding: false)
+    client = Rails::Shopee::Qris::Client.new(token: "header.#{payload}.signature")
+    assert_nil client.merchant_id
+    now = Time.now
+    result = client.match_transaction({ id: "TX", amount: 500, create_time: now, store_id: "12345",
+                                        merchant_id: "merchant-id", status: 3 },
+                                      amount: 500, created_at: now, expires_at: now + 300)
+    assert_equal "TX", result[:transaction_id]
+  end
+
+  def test_rejects_malformed_jwt_instead_of_using_it_as_payment_token
+    ["header.badjson.signature", "header.e30.signature", "header..signature", "not-a-token", 123].each do |token|
+      assert_raises(Rails::Shopee::Qris::Error) { Rails::Shopee::Qris::Client.new(token: token) }
+    end
+  end
+
+  def test_preserves_manual_and_inner_token_bytes
+    token = "B:token with\tspace\n"
+    assert_equal token, Rails::Shopee::Qris::Client.new(token: token).token
+    payload = Base64.urlsafe_encode64({ userid: "staff", token: token }.to_json, padding: false)
+    assert_equal token, Rails::Shopee::Qris::Client.new(token: "header.#{payload}.signature").token
+  end
+
+  def test_session_normalizes_mixed_keys_without_requiring_all_keys_to_be_strings
+    client = Rails::Shopee::Qris::Client.new(session: {
+      "token" => "B:session", :store_id => "store", "merchant" => { :id => "merchant", 7 => "extra" },
+      :switch_credential => { "spc_clientid" => "device" }
+    })
+    assert_equal "merchant", client.merchant_id
+    assert_equal "device", client.device_id
+    assert_equal "extra", client.session[:merchant][7]
+  end
+
+  def test_transaction_ranges_reject_invalid_values_before_requesting
+    client = payment_client([])
+    ["bad", "123bad", "", nil, false, Float::NAN, Float::INFINITY].each do |value|
+      assert_raises(Rails::Shopee::Qris::Error) { client.transactions_between(start_time: value, end_time: 100) }
+      assert_raises(Rails::Shopee::Qris::Error) { client.transactions_between(start_time: 1, end_time: value) }
+    end
+    assert_equal [], payment_client([{ code: 0, data: { list: [], next_position: "" } }]).transactions_between(start_time: "08", end_time: "09")
+  end
+
+  def test_transaction_detail_rejects_malformed_envelopes
+    [{ data: { issuer: "bank" } }, { code: 0, data: [] }, { code: 0.0, data: {} }].each do |payload|
+      assert_raises(Rails::Shopee::Qris::Error) { payment_client([payload]).transaction_detail("ORD") }
+    end
+  end
+
+  def test_malformed_history_is_not_reported_as_empty
+    [nil, {}, "bad", 1].each do |list|
+      payload = { code: 0, data: { list: list } }
+      assert_raises(Rails::Shopee::Qris::Error) do
+        payment_client([payload]).transactions_between(start_time: 1, end_time: 2)
+      end
+      assert_raises(Rails::Shopee::Qris::Error) { payment_client([payload]).list_stores }
+    end
   end
 
 

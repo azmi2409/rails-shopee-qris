@@ -30,9 +30,9 @@ module Rails
           parsed_token, token_meta = parse_token_input(raw_token)
           @token = parsed_token
           @store_id = (store_id || @session&.dig(:store_id) || config.store_id)&.to_s
-          @merchant_id = (merchant_id || @session&.dig(:merchant, :id) || @session&.dig(:merchant_id) || token_meta[:account_id] || config.merchant_id)&.to_s
+          @merchant_id = (merchant_id || (@session[:merchant][:id] if @session&.dig(:merchant).is_a?(Hash)) || @session&.dig(:merchant_id) || config.merchant_id)&.to_s
           @phone_number = phone_number || @session&.dig(:phone_number) || config.phone_number
-          @device_id = device_id || @session&.dig(:switch_credential, :spc_clientid)
+          @device_id = device_id || (@session[:switch_credential][:spc_clientid] if @session&.dig(:switch_credential).is_a?(Hash))
           expiry = expires_at || @session&.dig(:expires_at) || token_meta[:expires_at]
           @expires_at = extract_time(expiry)
           raise Error, "Invalid Shopee session expiry" if expiry && !@expires_at
@@ -48,7 +48,7 @@ module Rails
           raise Error, "Shopee static QRIS is not configured" if static_qris.to_s.empty?
 
           code = Qris.generate(static_qris, amount)
-          amount = Integer(amount)
+          amount = amount.is_a?(String) ? Integer(amount, 10) : Integer(amount)
           {
             qris_id: SecureRandom.hex(16),
             qris_code: code,
@@ -65,8 +65,7 @@ module Rails
 
         def refresh!
           unless refreshable?
-            raise Error, "Shopee merchant token is invalid or expired and this session has no renewal " \
-                         "credentials; log in again with OTP or paste a fresh B:... token"
+            raise Error, "Shopee session has no renewal credentials; log in again with OTP or paste a fresh B:... token"
           end
 
           updated = Setup.new.refresh_session(session)
@@ -77,11 +76,11 @@ module Rails
         end
 
         def transactions_between(start_time:, end_time:, store_id: @store_id, page_size: 10, max_pages: 20)
-          refresh! if refreshable? && expires_at && expires_at <= Time.now + 900
-
-          start_ts = start_time.respond_to?(:to_i) ? start_time.to_i : Integer(start_time)
-          end_ts = end_time.respond_to?(:to_i) ? end_time.to_i : Integer(end_time)
+          start_ts = transaction_timestamp(start_time)
+          end_ts = transaction_timestamp(end_time)
           raise Error, "Shopee transaction time range is invalid" if start_ts > end_ts
+
+          refresh! if refreshable? && expires_at && expires_at <= Time.now + 900
 
           size = [[1, page_size.to_i].max, 10].min
           pages_limit = [1, max_pages.to_i].max
@@ -107,7 +106,8 @@ module Rails
 
             resp = request_payment(TRANSACTIONS_URL, body)
             data = Response.data(resp)
-            list = data[:list].is_a?(Array) ? data[:list] : []
+            list = data[:list]
+            raise Error, "Shopee transaction list is missing or invalid" unless list.is_a?(Array)
 
             list.each do |raw|
               tx = normalize_transaction(raw, want_store)
@@ -216,7 +216,8 @@ module Rails
             body[:serviceList] = service_list if service_list
 
             data = Response.data(request_payment(STORES_URL, body))
-            list = data[:list].is_a?(Array) ? data[:list] : []
+            list = data[:list]
+            raise Error, "Shopee store list is missing or invalid" unless list.is_a?(Array)
 
             list.each do |raw|
               store = normalize_store(raw)
@@ -322,7 +323,7 @@ module Rails
           case obj
           when Hash
             obj.each_with_object({}) do |(k, v), acc|
-              acc[k.to_sym] = deep_symbolize(v)
+              acc[k.is_a?(String) ? k.to_sym : k] = deep_symbolize(v)
             end
           when Array
             obj.map { |item| deep_symbolize(item) }
@@ -331,28 +332,25 @@ module Rails
           end
         end
 
-        def parse_token_input(val)
-          return [nil, {}] if val.nil?
+        def transaction_timestamp(value)
+          return value.to_i if value.is_a?(Time) || (value.is_a?(Numeric) && value.finite?)
+          return Integer(value, 10) if value.is_a?(String) && value.match?(/\A[+-]?\d+\z/)
 
-          str = val.to_s.strip.gsub(/[\r\n\t ]/, "")
-          return [str, {}] if str.start_with?("B:")
+          raise Error, "Shopee transaction time range is invalid"
+        rescue ArgumentError, TypeError, RangeError
+          raise Error, "Shopee transaction time range is invalid"
+        end
 
-          if str.count(".") == 2
-            segments = str.split(".")
-            padded = segments[1] + ("=" * (-segments[1].bytesize % 4))
-            payload = JSON.parse(Base64.urlsafe_decode64(padded), symbolize_names: true)
-            if payload.is_a?(Hash) && payload[:token].to_s.start_with?("B:")
-              meta = {
-                account_id: payload[:userid]&.to_s,
-                expires_at: payload[:exp] ? Time.at(payload[:exp]) : nil
-              }
-              return [payload[:token].to_s, meta]
-            end
-          end
+        def parse_token_input(value)
+          return [nil, {}] if value.nil?
+          raise Error, "Shopee merchant token must be a string" unless value.is_a?(String)
+          return [value, {}] if value.start_with?("B:")
 
-          [str, {}]
-        rescue StandardError
-          [str, {}]
+          credential = Setup.new.read_merchant_credential([
+            { name: Setup::LIVE_TOKEN_COOKIE, value: value, domain: "partner.shopee.co.id", path: "/" }
+          ])
+          expiry = credential[:expires_at]
+          [credential[:token], { expires_at: expiry && Time.at(expiry / 1000.0) }]
         end
 
 
@@ -381,7 +379,7 @@ module Rails
             end
 
             raise Error.new(
-              "Shopee rejected the merchant token (code #{code}); it is invalid or expired. " \
+              "Shopee rejected the merchant token (code #{code}). " \
               "Log in again with OTP or paste a fresh B:... token.",
               nil, resp[:code], resp
             )
@@ -389,6 +387,7 @@ module Rails
 
           err = Response.error(resp)
           raise Error.new(err || "ShopeePay request failed", nil, resp[:code], resp) if err
+          Response.data(resp)
 
           resp
         end

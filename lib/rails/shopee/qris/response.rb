@@ -9,10 +9,8 @@ module Rails
         # Shopee answers many failures with a bare numeric code and no message.
         # Map the ones we have observed so callers get something actionable.
         CODE_HINTS = {
-          10002 => "The Shopee account has no password set",
           200020 => "Shopee rejected the token as invalid or expired",
           2010000 => "Shopee request carried no token",
-          48401003 => "Shopee rejected the OTP code as wrong or expired",
           48401102 => "Shopee requires the account password before sending an OTP",
           48401103 => "Shopee refused to send the OTP on the requested channel",
           48500102 => "The Shopee account session has expired; log in again with an OTP"
@@ -37,7 +35,11 @@ module Rails
           end
 
           code = payload[:code] || payload[:errorCode] || payload[:error]
-          code_i = Integer(code) rescue nil
+          code_i = if code.is_a?(Integer)
+                     code
+                   elsif code.is_a?(String) && code.match?(/\A-?\d+\z/)
+                     Integer(code, 10)
+                   end
           is_success_code = code_i == 0
 
           errors = payload[:errors] || inner[:errors]

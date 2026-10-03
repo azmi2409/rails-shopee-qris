@@ -2,7 +2,7 @@
 
 Gem::Specification.new do |spec|
   spec.name = "rails-shopee-qris"
-  spec.version = "0.2.0"
+  spec.version = "0.2.1"
   spec.authors = ["Azmi"]
   spec.summary = "Unofficial ShopeePay QRIS client"
   spec.description = "Generate dynamic QRIS codes and access ShopeePay merchant transactions."

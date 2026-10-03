@@ -1,7 +1,7 @@
 PATH
   remote: .
   specs:
-    rails-shopee-qris (0.1.0)
+    rails-shopee-qris (0.2.1)
 
 GEM
   remote: https://rubygems.org/
@@ -16,7 +16,7 @@ DEPENDENCIES
 
 CHECKSUMS
   bundler (4.0.11) sha256=5bcec0fb78302e48d02ee46f10ee6e6942be647ba5b44a6d1ddfda9a240ce785
-  rails-shopee-qris (0.1.0)
+  rails-shopee-qris (0.2.1)
 
 BUNDLED WITH
   4.0.11

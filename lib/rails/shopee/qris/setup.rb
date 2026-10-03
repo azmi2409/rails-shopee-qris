@@ -21,9 +21,9 @@ module Rails
         CHANNEL_NAMES = { 1 => "SMS", 2 => "voice", 3 => "WhatsApp", 4 => "email", 5 => "Zalo" }.freeze
         NEED_OTP_CODE = 48401102
         NOT_LOGIN_CODE = 48500102
-        NO_PASSWORD_CODE = 10002
+        EMPTY_PASSWORD_CONTINUATION_CODE = 10002
         OTP_CHANNEL_UNAVAILABLE_CODE = 48401103
-        WRONG_OTP_CODE = 48401003
+        OTP_REJECTED_CODE = 48401003
         PASSWORD_REQUIRED = "This Shopee account is password-protected; supply the password to receive an OTP"
 
         LIVE_TOKEN_COOKIE = "__shopee_partner_website_x_token_live"
@@ -39,6 +39,9 @@ module Rails
         def request_otp(phone_number = Rails::Shopee::Qris.configuration.phone_number, password: nil, channel: nil, device_report: Rails::Shopee::Qris.configuration.device_report)
           phone_info = parse_id_mobile(phone_number)
           raise Error, "Supply a captured Shopee device report to request an OTP" unless device_report.is_a?(String) && !device_report.strip.empty?
+          if !channel.nil? && (!channel.is_a?(Integer) || !SEND_OTP_CHANNELS.include?(channel))
+            raise Error, "Invalid Shopee OTP channel"
+          end
           phone = phone_info[:e164]
           @cookies.clear
 
@@ -61,15 +64,21 @@ module Rails
             fingerprint
           )
 
-          available = (settings[:available_channel_list] || []).select { |c| c.is_a?(Integer) }
+          available = settings[:available_channel_list].nil? ? [] : settings[:available_channel_list]
+          unless available.is_a?(Array) && available.all? { |c| c.is_a?(Integer) && SEND_OTP_CHANNELS.include?(c) }
+            raise Error, "Shopee returned invalid available OTP channels"
+          end
           default_ch = settings[:default_channel]
           resolved = channel || default_ch || DEFAULT_OTP_CHANNEL
+          unless resolved.is_a?(Integer) && SEND_OTP_CHANNELS.include?(resolved)
+            raise Error, "Shopee returned an invalid OTP channel"
+          end
           if !available.empty? && !available.include?(resolved)
             names = available.map { |c| "#{c} (#{CHANNEL_NAMES[c] || 'unknown'})" }.join(", ")
             raise Error, "Shopee OTP channel #{resolved} is unavailable for this account; available: #{names}"
           end
 
-          begin
+          sent = begin
             account_request(
               "/api/v4/account/business/send_otp",
               {
@@ -86,7 +95,7 @@ module Rails
           rescue Error => e
             raise Error.new(
               e.code == OTP_CHANNEL_UNAVAILABLE_CODE ?
-                "Shopee refused to send the OTP on channel #{resolved}; choose another available channel" :
+                "Shopee refused OTP at /api/v4/account/business/send_otp on channel #{resolved}; choose another available channel" :
                 e.message,
               e.status, e.code, e.payload
             )
@@ -101,6 +110,8 @@ module Rails
             risk_token: fingerprint,
             has_password: has_password,
             cookies: snapshot_cookies,
+            # Opaque provider field; neither its meaning nor OTP delivery is established.
+            seed: sent[:seed],
             requested_at: (Time.now.to_f * 1000).to_i
           }
         end
@@ -133,10 +144,10 @@ module Rails
               fingerprint
             )
           rescue Error => e
-            raise e unless e.code.to_s == WRONG_OTP_CODE.to_s
+            raise e unless e.code.to_s == OTP_REJECTED_CODE.to_s
 
             raise Error.new(
-              "Shopee rejected the OTP code (wrong or expired); request a new one and try again",
+              "Shopee rejected the OTP at /api/v4/account/business/verify_otp; cause is not established",
               e.status, e.code, e.payload
             )
           end
@@ -198,7 +209,7 @@ module Rails
           merchant, credential = complete_base(verification, merchant_id)
           profile = get_profile(credential[:token], merchant[:id])
 
-          data_client = client || Client.new(token: credential[:token])
+          data_client = client || Client.new(token: credential[:token], merchant_id: merchant[:id])
           stores = data_client.list_stores
           chosen_store = choose_store_id(stores, store_id, profile[:store_id])
 
@@ -220,7 +231,7 @@ module Rails
             },
             profile: profile,
             created_at: (Time.now.to_f * 1000).to_i,
-            expires_at: credential[:expires_at] ? Time.at(credential[:expires_at] / 1000) : nil
+            expires_at: credential[:expires_at] ? Time.at(credential[:expires_at] / 1000.0) : nil
           }
         end
 
@@ -246,9 +257,9 @@ module Rails
           validate_strings(switch_cred, :toc_nonce, :spc_clientid, :device_fingerprint)
 
           restore_cookies(session[:cookies] || [])
-          alive, payload = login_status
+          alive, payload, status = login_status
           unless alive
-            raise Error.new("The Shopee account session has expired; log in again with an OTP", nil, NOT_LOGIN_CODE, payload)
+            raise Error.new("The Shopee account session has expired; log in again with an OTP", status, NOT_LOGIN_CODE, payload)
           end
 
           verification = {
@@ -268,7 +279,7 @@ module Rails
           session.merge(
             cookies: snapshot_cookies,
             token: credential[:token],
-            expires_at: credential[:expires_at] ? Time.at(credential[:expires_at] / 1000) : session[:expires_at]
+            expires_at: credential[:expires_at] ? Time.at(credential[:expires_at] / 1000.0) : session[:expires_at]
           )
         end
 
@@ -303,8 +314,8 @@ module Rails
           jwt = cookie ? cookie[:value] : nil
           raise Error, "Shopee login did not return a merchant session token" unless jwt.is_a?(String) && !jwt.empty?
 
-          segments = jwt.split(".")
-          raise Error, "Invalid JWT format" unless segments.length == 3 && !segments[1].empty?
+          segments = jwt.split(".", -1)
+          raise Error, "Invalid JWT format" unless segments.length == 3 && segments.all? { |segment| segment.match?(/\A[A-Za-z0-9_-]+\z/) }
 
           padded = segments[1] + ("=" * (-segments[1].bytesize % 4))
           payload = JSON.parse(Base64.urlsafe_decode64(padded), symbolize_names: true)
@@ -327,8 +338,12 @@ module Rails
 
         def symbolize_state(value)
           case value
-          when Hash then value.to_h { |key, item| [key.to_sym, symbolize_state(item)] }
+          when Hash
+            raise Error, "Invalid Shopee state keys" unless value.keys.all? { |key| key.is_a?(String) || key.is_a?(Symbol) }
+
+            value.to_h { |key, item| [key.to_sym, symbolize_state(item)] }
           when Array then value.map { |item| symbolize_state(item) }
+          when String then value.dup
           else value
           end
         end
@@ -382,6 +397,10 @@ module Rails
           body = { phone: phone, password: hash_shopee_password(password) }
           account_request("/api/v4/account/business/check_account_exist_by_password", body, fingerprint)
         rescue Error => e
+          if e.payload.is_a?(Hash)
+            data = e.payload[:data]
+            raise if e.payload[:captcha_required] == true || data.is_a?(Hash) && data[:captcha_required] == true
+          end
           raise unless e.status && (200..299).cover?(e.status) && e.code.is_a?(Integer) && e.code != 0
 
           nil
@@ -398,31 +417,35 @@ module Rails
           parsed = parse_json(resp)
 
           if parsed[:error] == NEED_OTP_CODE
-            raise Error, PASSWORD_REQUIRED if password.to_s.empty?
+            if password.to_s.empty?
+              raise Error.new("#{PASSWORD_REQUIRED} (at /api/v4/account/business/authenticate_toc_by_password)", resp.code.to_i, parsed[:error], parsed)
+            end
 
             return true
           end
 
-          return false if parsed[:error] == 0
-          # 10002: the account exists but has no password set — nothing to verify.
-          return false if parsed[:error] == NO_PASSWORD_CODE
+          return false if parsed[:error] == 0 && parsed[:data].is_a?(Hash)
+          # Only this empty-password response was observed to permit OTP requests.
+          # Its provider meaning remains unknown; never bypass a supplied password.
+          return nil if password.to_s.empty? && parsed[:error] == EMPTY_PASSWORD_CONTINUATION_CODE
 
-          account = parsed[:data].is_a?(Hash) ? parsed[:data][:toc_account] : nil
-          if account.is_a?(Hash) && account[:has_password] == true
-            raise Error, PASSWORD_REQUIRED
-          end
-
-          # Any other code means this account does not authenticate by password;
-          # OTP delivery is validated by send_otp afterwards.
-          false
+          raise Error.new(
+            "Shopee rejected password authentication at /api/v4/account/business/authenticate_toc_by_password (error #{parsed[:error]})",
+            resp.code.to_i, parsed[:error], parsed
+          )
         end
 
         def login_status
           headers = account_headers.merge("Content-Type" => "application/json")
           resp = send_request(:post, "#{ACCOUNT_BASE_URL}/api/v4/account/business/login_status", headers: headers, body: "{}")
           parsed = parse_json(resp)
-          raise Error, "Shopee returned a malformed login status" unless parsed[:error].is_a?(Integer)
-          [parsed[:error] == 0, parsed]
+          unless parsed[:error].is_a?(Integer)
+            raise Error.new("Shopee returned a malformed login status at /api/v4/account/business/login_status", resp.code.to_i, parsed[:error], parsed)
+          end
+          unless [0, NOT_LOGIN_CODE].include?(parsed[:error])
+            raise Error.new("Shopee login status failed at /api/v4/account/business/login_status", resp.code.to_i, parsed[:error], parsed)
+          end
+          [parsed[:error] == 0, parsed, resp.code.to_i]
         end
 
         def complete_base(verification, merchant_id)
@@ -546,7 +569,7 @@ module Rails
 
           if parsed[:error] != 0 || !parsed[:data].is_a?(Hash)
             err = Response.error(parsed)
-            raise Error.new(err || "Shopee account request failed at #{path}", resp.code.to_i, parsed[:error], parsed)
+            raise Error.new("Shopee account request failed at #{path}: #{err || 'invalid response'}", resp.code.to_i, parsed[:error], parsed)
           end
 
           parsed[:data].is_a?(Hash) ? parsed[:data] : {}
@@ -639,6 +662,9 @@ module Rails
           end
           parsed = JSON.parse(response.body.to_s, symbolize_names: true)
           raise Error.new("Shopee returned a malformed JSON envelope", response.code.to_i) unless parsed.is_a?(Hash)
+          if parsed[:captcha_required] == true || parsed[:data].is_a?(Hash) && parsed[:data][:captcha_required] == true
+            raise Error.new(Response.error(parsed), response.code.to_i, parsed[:error] || parsed[:errorCode] || parsed[:code], parsed)
+          end
 
           parsed
         rescue JSON::ParserError
@@ -726,7 +752,7 @@ module Rails
 
         def snapshot_cookies
           @cookies.delete_if { |_, cookie| cookie[:expires] && cookie[:expires] <= Time.now.to_f }
-          @cookies.values.map(&:dup)
+          symbolize_state(@cookies.values)
         end
 
         def restore_cookies(cookie_list)
@@ -744,7 +770,7 @@ module Rails
             next if name.match?(/[\s,;]/) || cookie[:value].to_s.match?(/[\r\n;]/)
             next if cookie[:expires] && (!cookie[:expires].is_a?(Numeric) || !cookie[:expires].finite?)
 
-            @cookies[[name, domain, path]] = cookie.merge(name: name, value: cookie[:value].to_s, domain: domain, path: path)
+            @cookies[[name, domain, path]] = symbolize_state(cookie.merge(name: name, value: cookie[:value].to_s, domain: domain, path: path))
           end
         end
       end

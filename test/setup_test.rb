@@ -34,61 +34,8 @@ class SetupTest < Minitest::Test
     assert_equal expected, setup.hash_shopee_password("secret123")
   end
 
-  def test_request_otp_runs_bootstrap_and_sends_otp
-    setup_class = Class.new(Rails::Shopee::Qris::Setup) do
-      attr_reader :sent_calls
 
-      def initialize(...)
-        @sent_calls = []
-        super(...)
-      end
-
-      private
-
-      def execute_request(req, uri)
-        @sent_calls << { method: req.method, url: uri.to_s, body: req.body }
-        case uri.path
-        when "/login"
-          # Bootstrap
-          fake_response(200, "<html></html>", { "set-cookie" => ["SPC_CLIENTID=mock_client_id; Domain=shopee.co.id; Path=/"] })
-        when "/v2/shpsec/web/report"
-          # Fingerprint
-          fake_response(200, { code: 0, data: { riskToken: "risk_token_abc" } }.to_json)
-        when "/api/v4/account/business/check_password_migrate"
-          fake_response(200, { error: 0, data: {} }.to_json)
-        when "/api/v4/account/business/check_account_exist_by_password"
-          fake_response(200, { error: 0, data: {} }.to_json)
-        when "/api/v4/account/business/authenticate_toc_by_password"
-          fake_response(200, { error: 0, data: {} }.to_json)
-        when "/api/v4/account/business/get_otp_settings"
-          fake_response(200, { error: 0, data: { available_channel_list: [1, 3], default_channel: 3 } }.to_json)
-        when "/api/v4/account/business/send_otp"
-          fake_response(200, { error: 0, data: {} }.to_json)
-        else
-          fake_response(200, { error: 0, data: {} }.to_json)
-        end
-      end
-
-      def fake_response(code, body, headers = {})
-        res = Net::HTTPResponse::CODE_TO_OBJ[code.to_s].new("1.1", code.to_s, "OK")
-        headers.each { |k, v| Array(v).each { |val| res.add_field(k, val) } }
-        res.instance_variable_set(:@read, true)
-        res.body = body
-        res
-      end
-    end
-
-    setup = setup_class.new
-    challenge = setup.request_otp("081234567890", device_report: "captured-browser-report")
-
-    assert_equal 1, challenge[:version]
-    assert_equal "6281234567890", challenge[:phone_number]
-    assert_equal 3, challenge[:channel]
-    assert_equal "risk_token_abc", challenge[:device_fingerprint]
-    refute_nil challenge[:cookies]
-  end
-
-  def test_request_otp_continues_when_account_has_no_password
+  def test_request_otp_continues_for_observed_empty_password_response
     setup_class = Class.new(Rails::Shopee::Qris::Setup) do
       attr_reader :sent_calls
 
@@ -128,7 +75,7 @@ class SetupTest < Minitest::Test
 
     challenge = setup_class.new.request_otp("081234567890", device_report: "captured-report")
 
-    assert_equal false, challenge[:has_password]
+    assert_nil challenge[:has_password]
     assert_equal 1, challenge[:channel]
     assert_equal [1, 2], challenge[:available_channels]
   end
@@ -167,7 +114,7 @@ class SetupTest < Minitest::Test
     assert_includes error.message, "SMS"
   end
 
-  def test_verify_otp_maps_wrong_code_to_actionable_message
+  def test_verify_otp_preserves_provider_rejection_details
     setup_class = Class.new(Rails::Shopee::Qris::Setup) do
       private
 
@@ -198,8 +145,11 @@ class SetupTest < Minitest::Test
 
     error = assert_raises(Rails::Shopee::Qris::Error) { setup_class.new.verify_otp(challenge, "000000") }
 
-    assert_includes error.message, "wrong or expired"
+    assert_includes error.message, "/api/v4/account/business/verify_otp"
+    refute_match(/wrong|expired/, error.message)
     assert_equal 48_401_003, error.code
+    assert_equal 200, error.status
+    assert_equal({ error: 48_401_003 }, error.payload)
   end
 
   def test_verify_otp_authenticates_and_detects_merchants
@@ -507,6 +457,144 @@ class SetupTest < Minitest::Test
     auth = AuthTransport.new
     auth.failure = auth.send(:response, 403, "denied")
     assert_raises(Rails::Shopee::Qris::Error) { auth.send(:follow_get, "https://partner.shopee.co.id/login") }
+  end
+
+  class OtpTransport < AuthTransport
+    attr_accessor :password_error, :settings_channel, :available_channels
+
+    def initialize
+      super
+      @password_error = 10002
+      @settings_channel = 3
+    end
+
+    private
+
+    def execute_request(request, uri)
+      @requests << [uri, request["Cookie"]]
+      case uri.path
+      when "/v2/shpsec/web/report"
+        response(200, { code: 0, data: { riskToken: "risk" } }.to_json)
+      when "/api/v4/account/business/authenticate_toc_by_password"
+        response(200, { error: password_error, data: {} }.to_json)
+      when "/api/v4/account/business/get_otp_settings"
+        response(200, { error: 0, data: { default_channel: settings_channel, available_channel_list: available_channels } }.to_json)
+      when "/api/v4/account/business/send_otp"
+        response(200, { error: 0, data: { seed: "opaque" } }.to_json)
+      else
+        response(200, { error: 0, data: {} }.to_json)
+      end
+    end
+  end
+
+  def test_password_errors_stop_before_otp_and_keep_provider_details
+    [[10002, "wrong"], [12345, nil], [12345, "wrong"], [48401104, "wrong"]].each do |code, password|
+      auth = OtpTransport.new
+      auth.password_error = code
+      error = assert_raises(Rails::Shopee::Qris::Error) do
+        auth.request_otp("081234567890", password: password, device_report: "captured-report")
+      end
+      assert_equal code, error.code
+      assert_equal 200, error.status
+      assert_equal code, error.payload[:error]
+      assert_includes error.message, "/api/v4/account/business/authenticate_toc_by_password"
+      refute auth.requests.any? { |uri, _| uri.path.end_with?("/send_otp") }
+    end
+  end
+
+  def test_password_required_response_preserves_code_and_accepts_supplied_password
+    auth = OtpTransport.new
+    auth.password_error = 48401102
+    error = assert_raises(Rails::Shopee::Qris::Error) do
+      auth.request_otp("081234567890", device_report: "captured-report")
+    end
+    assert_equal 48401102, error.code
+    assert_equal 200, error.status
+    refute auth.requests.any? { |uri, _| uri.path.end_with?("/send_otp") }
+    challenge = auth.request_otp("081234567890", password: "secret", device_report: "captured-report")
+    assert_equal true, challenge[:has_password]
+    assert_equal "opaque", challenge[:seed]
+  end
+
+  def test_invalid_channels_fail_before_otp
+    ["3", 0, 6, false].each do |channel|
+      auth = OtpTransport.new
+      assert_raises(Rails::Shopee::Qris::Error) do
+        auth.request_otp("081234567890", channel: channel, device_report: "captured-report")
+      end
+      assert_empty auth.requests
+    end
+    auth = OtpTransport.new
+    auth.settings_channel = "3"
+    assert_raises(Rails::Shopee::Qris::Error) { auth.request_otp("081234567890", device_report: "captured-report") }
+    refute auth.requests.any? { |uri, _| uri.path.end_with?("/send_otp") }
+  end
+
+  def test_malformed_available_channels_never_send_otp
+    [false, "3", {}, ["3"], [3, "1"], [6]].each do |channels|
+      auth = OtpTransport.new
+      auth.available_channels = channels
+      assert_raises(Rails::Shopee::Qris::Error) do
+        auth.request_otp("081234567890", device_report: "captured-report")
+      end
+      refute auth.requests.any? { |uri, _| uri.path.end_with?("/send_otp") }
+    end
+  end
+
+
+  def test_captcha_challenges_never_continue_account_authentication
+    [{ error: 10002, captcha_required: true }, { error: 0, data: { captcha_required: true } }].each do |payload|
+      [:check_account_exists, :authenticate_by_password].each do |operation|
+        auth = AuthTransport.new
+        auth.failure = auth.send(:response, 200, payload.to_json)
+        error = assert_raises(Rails::Shopee::Qris::Error) do
+          auth.send(operation, "6281234567890", nil, "risk")
+        end
+        assert_equal payload, error.payload
+        assert_equal 200, error.status
+      end
+    end
+  end
+
+  def test_unknown_login_status_does_not_become_expiry
+    auth = AuthTransport.new
+    auth.failure = auth.send(:response, 200, { error: 12345 }.to_json)
+    session = { version: 1, cookies: [], switch_credential: { toc_nonce: "nonce", spc_clientid: "client", device_fingerprint: "risk" } }
+    error = assert_raises(Rails::Shopee::Qris::Error) { auth.refresh_session(session) }
+    assert_equal 12345, error.code
+    assert_equal 200, error.status
+    assert_includes error.message, "/api/v4/account/business/login_status"
+  end
+
+  def test_cookie_snapshots_do_not_share_mutable_values
+    auth = AuthTransport.new
+    source = [{ name: "sid", value: "secret".dup, domain: "shopee.co.id", path: "/" }]
+    auth.send(:restore_cookies, source)
+    source.first[:value].replace("changed")
+    snapshot = auth.send(:snapshot_cookies)
+    snapshot.first[:value].replace("changed-again")
+    assert_equal "sid=secret", auth.send(:build_cookie_header, URI("https://partner.shopee.co.id/"))
+  end
+
+  def test_invalid_jwt_shape_and_state_keys_raise_library_errors
+    auth = AuthTransport.new
+    [".#{Base64.urlsafe_encode64({ token: 'B:test', userid: 8888 }.to_json, padding: false)}.signature", "a.b.", "a.b.c.d"].each do |jwt|
+      cookies = [{ name: Rails::Shopee::Qris::Setup::LIVE_TOKEN_COOKIE, value: jwt, domain: "partner.shopee.co.id", path: "/" }]
+      assert_raises(Rails::Shopee::Qris::Error) { auth.read_merchant_credential(cookies) }
+    end
+    assert_raises(Rails::Shopee::Qris::Error) { auth.verify_otp({ 1 => "invalid" }, "123456") }
+    assert_empty auth.requests
+  end
+
+  def test_malformed_password_success_does_not_request_otp
+    auth = AuthTransport.new
+    auth.failure = auth.send(:response, 200, { error: 0, data: [] }.to_json)
+    error = assert_raises(Rails::Shopee::Qris::Error) do
+      auth.send(:authenticate_by_password, "6281234567890", nil, "risk")
+    end
+    assert_equal 200, error.status
+    assert_equal 0, error.code
+    assert_includes error.message, "/api/v4/account/business/authenticate_toc_by_password"
   end
 
   private

@@ -2,15 +2,17 @@
 
 Unofficial Ruby/Rails ShopeePay Partner client, based on `QrisMerchantID` Shopee API logic and `rails-gopay-unofficial` gem structure. Ruby >= 3.1; no runtime dependencies beyond stdlib.
 
-Use only with merchant authorization. Internal Shopee APIs can change. Read paths (`get-store-list`, `get-transaction-list`, `get-transaction-detail`, device-risk, OTP request/verify) have been exercised against a live merchant account; actual money settlement has not. Never log tokens, passwords, device reports, session cookies, or raw payment data.
+Use only with merchant authorization. Internal Shopee APIs can change. Store listing and an empty transaction feed were observed with a merchant token. OTP endpoints accepted requests, but recipients reported no delivery; successful OTP login and money settlement remain unverified. Never log tokens, passwords, device reports, session cookies, or raw payment data.
 
 ## Installation
 
-Until published, use a local path:
+Install published version from RubyGems:
 
 ```ruby
-gem "rails-shopee-qris", path: "../rails-shopee-qris"
+gem "rails-shopee-qris", "~> 0.2.0"
 ```
+
+Version 0.2.1 contains the reviewed validation and merchant-scope fixes; it must be published before RubyGems consumers can install it. To exercise this checkout locally, use `gem "rails-shopee-qris", path: "../rails-shopee-qris"`.
 
 ```ruby
 require "rails/shopee/qris"
@@ -24,7 +26,7 @@ end
 
 ## Direct merchant token
 
-Pass either the inner `B:...` token, or the whole `__shopee_partner_website_x_token_live` cookie value — the client decodes that JWT and pulls out the inner `token` (plus `userid` and `exp`). It does not verify the JWT signature; Shopee validates credentials on each request.
+Pass either the inner `B:...` token or the whole `__shopee_partner_website_x_token_live` cookie value. Client extracts the inner token and advisory expiry. JWT `userid` is a staff account ID, **not** merchant ID; provide merchant scope explicitly when known. JWT decoding does not verify its signature; Shopee validates credentials on each request.
 
 Get a fresh token: log in at `partner.shopee.co.id` → DevTools → Network → open the ShopeePay transaction history page → click `get-transaction-list` → Request Payload → `data.metadata.token`.
 
@@ -63,6 +65,10 @@ end
 Channels: `1` SMS, `2` voice, `3` WhatsApp, `4` email, `5` Zalo. Omit `channel:` to use the channel Shopee recommends for that account; asking for an unavailable one raises with the available list. `verify_otp(challenge, otp)` also returns verification separately, reusable by `complete_login(verification, merchant_id:, store_id:)`. Requested store must belong to selected merchant; multiple stores can leave `store_id` unset, requiring explicit selection before transaction reconciliation.
 
 Persist **entire** session encrypted, including `cookies`, `merchant`, `merchants`, and `switch_credential`. These are credentials, not safe client-side session data.
+
+OTP request success and optional `seed` do not prove SMS/WhatsApp delivery. `device_report` means the raw browser SDK report request body, not the `riskToken` returned by its response. No reliable report-format or delivery-status check is available here. Do not retry repeatedly or switch channels without merchant consent.
+
+Rails cookie sessions cannot hold full Shopee state (4 KB limit). Use server-side sessions; memory-backed development sessions disappear on restart. Never persist passwords for resend—prompt again when required.
 
 ```ruby
 serialized = JSON.generate(shopee_session)
@@ -136,10 +142,10 @@ Invalid provider envelopes, HTTP failures, expired credentials, malformed inputs
 
 | Code | Meaning |
 | --- | --- |
-| `10002` | Account has no password set (not an error — the OTP flow continues) |
+| `10002` | Undocumented password-auth response; empty-password probe may continue to OTP, but it does not prove account existence or password state |
 | `200020` | Token invalid or expired — paste a fresh one |
 | `2010000` | Request carried no token |
-| `48401003` | OTP code wrong or expired |
+| `48401003` | Credential rejected; when returned by OTP verification, the OTP was rejected (reason unspecified) |
 | `48401102` | Password required before an OTP is sent |
 | `48401103` | OTP channel unavailable for this account |
 | `48500102` | Account session expired; log in again with an OTP |
@@ -156,7 +162,7 @@ gem build rails-shopee-qris.gemspec
 Package with `gem build rails-shopee-qris.gemspec`. Authenticate via `gem signin` (or configure a scoped `GEM_HOST_API_KEY` with push permission), then:
 
 ```sh
-gem push rails-shopee-qris-0.2.0.gem --host https://rubygems.org
+gem push rails-shopee-qris-0.2.1.gem --host https://rubygems.org
 ```
 
 RubyGems versions are immutable. Bump the gemspec version before subsequent releases. Built `.gem` files and credentials must not be committed.

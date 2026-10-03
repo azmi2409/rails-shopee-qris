@@ -10,7 +10,7 @@ module Rails
           unless amount.is_a?(Integer) || (amount.is_a?(String) && amount.match?(/\A\d+\z/))
             raise Error, "Invalid payment amount"
           end
-          amount = Integer(amount)
+          amount = amount.is_a?(String) ? Integer(amount, 10) : amount
           raise Error, "Payment amount must be greater than zero" unless amount.positive?
           raise Error, "Payment amount exceeds QRIS field length" if amount.to_s.bytesize > 99
 
